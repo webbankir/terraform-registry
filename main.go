@@ -26,7 +26,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"regexp"
@@ -253,7 +252,6 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 	downloadURL := ""
 	shasumURL := ""
 	shasumSigURL := ""
-	signKeyURL := ""
 
 	var repo *github.RepositoryRelease
 	for _, r := range repos {
@@ -283,9 +281,6 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 			shasumSigURL, _ = client.getURL(c, a)
 			continue
 		}
-		if *a.Name == signKeyFilename {
-			signKeyURL, _ = client.getURL(c, a)
-		}
 	}
 
 	shasum, err := getShasum(filename, shasumURL)
@@ -295,7 +290,7 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 			Message: fmt.Sprintf("failed getting shasum %v", err),
 		})
 	}
-	pgpPublicKey, pgpPublicKeyID, err := getPublicKey(signKeyURL)
+	pgpPublicKey, pgpPublicKeyID, err := getPublicKey()
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, &ErrorResponse{
 			Status:  http.StatusBadRequest,
@@ -330,18 +325,8 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 	}
 }
 
-func getPublicKey(url string) (string, string, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return "", "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		return "", "", fmt.Errorf("not found")
-	}
-
-	data, err := ioutil.ReadAll(resp.Body)
+func getPublicKey() (string, string, error) {
+	data, err := os.ReadFile("/root/signkey.asc")
 	if err != nil {
 		return "", "", err
 	}
