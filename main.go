@@ -247,7 +247,6 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 	filename := fmt.Sprintf("%s_%s_%s_%s.zip", provider, version, os, arch)
 	shasumFilename := fmt.Sprintf("%s_%s_SHA256SUMS", provider, version)
 	shasumSigFilename := fmt.Sprintf("%s_%s_SHA256SUMS.sig", provider, version)
-	signKeyFilename := "signkey.asc"
 
 	downloadURL := ""
 	shasumURL := ""
