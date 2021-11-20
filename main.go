@@ -26,7 +26,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -48,6 +50,7 @@ var (
 	shasumRegexp = regexp.MustCompile(`^(?P<provider>[^_]+)_(?P<version>[^_]+)_SHA256SUMS`)
 	binaryRegexp = regexp.MustCompile(`^(?P<provider>[^_]+)_(?P<version>[^_]+)_(?P<os>\w+)_(?P<arch>\w+)`)
 	actionRegexp = regexp.MustCompile(`^(?P<version>[^/]+)/(?P<action>[^/]+)/(?P<os>[^/]+)/(?P<arch>\w+)`)
+	storageDir   = "/opt/terraform-provider-proxy"
 )
 
 func main() {
@@ -58,8 +61,21 @@ func main() {
 
 	e.GET("/.well-known/terraform.json", serviceDiscoveryHandler())
 	e.GET("/v1/providers/:namespace/:type/*", client.providerHandler())
+	e.GET("/storage/:file", fromStorage())
+	_ = e.Start(":8181")
+}
 
-	_ = e.Start(":8080")
+func fromStorage() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		file := c.Param("file")
+
+		data, err := os.ReadFile(storageDir + "/" + file)
+		if err != nil {
+			return echo.NewHTTPError(http.StatusNotFound, "File not found")
+		}
+
+		return c.Blob(http.StatusOK, "application/octet-stream", data)
+	}
 }
 
 func serviceDiscoveryHandler() echo.HandlerFunc {
@@ -162,6 +178,48 @@ func (client *Client) getURL(c echo.Context, asset *github.ReleaseAsset) (string
 	}
 
 	return *asset.BrowserDownloadURL, nil
+}
+
+func filesToStorage(assetURL string) (string, error) {
+	u, err := url.Parse(assetURL)
+
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := os.Stat(storageDir + u.Path); os.IsNotExist(err) {
+		items := strings.Split(u.Path, "/")
+		items = items[:len(items)-1]
+		newDir := fmt.Sprintf("%v%v", storageDir, strings.Join(items, "/"))
+		err = os.MkdirAll(newDir, 0777)
+
+		if err != nil {
+			return "", err
+		}
+
+		resp, err := http.Get(assetURL)
+
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != 200 {
+			return "", fmt.Errorf("not found")
+		}
+		b, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", err
+		}
+
+		//_, err = ff.Write(b)
+		err = os.WriteFile(storageDir+u.Path, b, 0644)
+		if err != nil {
+			return "", err
+		}
+
+	}
+	return "https://tf-providers.infra.tec1group.com/storage" + u.Path, nil
 }
 
 func getShasum(asset string, shasumURL string) (string, error) {
@@ -282,6 +340,22 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 		}
 	}
 
+	downloadURL, err := filesToStorage(downloadURL)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, &ErrorResponse{
+			Status:  http.StatusBadRequest,
+			Message: fmt.Sprintf("[WB] Error: %v", err),
+		})
+	}
+
+	shasumSigURL, err = filesToStorage(shasumSigURL)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, &ErrorResponse{
+			Status:  http.StatusBadRequest,
+			Message: fmt.Sprintf("[WB] Error: %v", err),
+		})
+	}
+
 	shasum, err := getShasum(filename, shasumURL)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, &ErrorResponse{
@@ -289,6 +363,15 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 			Message: fmt.Sprintf("failed getting shasum %v", err),
 		})
 	}
+
+	shasumURL, err = filesToStorage(shasumURL)
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, &ErrorResponse{
+			Status:  http.StatusBadRequest,
+			Message: fmt.Sprintf("[WB] Error: %v", err),
+		})
+	}
+
 	pgpPublicKey, pgpPublicKeyID, err := getPublicKey()
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, &ErrorResponse{

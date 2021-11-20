@@ -1,0 +1,1 @@
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o app -ldflags "-X main.GitCommit=0.0.1"
