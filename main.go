@@ -61,6 +61,7 @@ func main() {
 	client := newClient()
 
 	e.GET("/.well-known/terraform.json", serviceDiscoveryHandler())
+	e.GET("/v1/providers/hashicorp/:type/versions", client.providerHandlerHashicorp())
 	e.GET("/v1/providers/:namespace/:type/*", client.providerHandler())
 	e.GET("/storage/:file", fromStorage())
 	_ = e.Start(":8181")
@@ -233,6 +234,23 @@ func (client *Client) providerHandler() echo.HandlerFunc {
 	}
 }
 
+func (client *Client) providerHandlerHashicorp() echo.HandlerFunc {
+	return func(c echo.Context) error {
+		d, err := http.Get("https://registry.terraform.io" + c.Request().URL.Path)
+
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, &ErrorResponse{
+				Status:  http.StatusBadRequest,
+				Message: err.Error(),
+			})
+		}
+
+		data := VersionResponse{}
+		err = json.NewDecoder(d.Body).Decode(&data)
+		return c.JSON(http.StatusOK, data)
+	}
+}
+
 func (client *Client) performAction(c echo.Context, param string, repos []*github.RepositoryRelease) error {
 
 	match := actionRegexp.FindStringSubmatch(param)
@@ -249,6 +267,7 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 			result[name] = match[i]
 		}
 	}
+	namespace := c.Get("namespace").(string)
 	provider := c.Get("provider").(string)
 	version := result["version"]
 	os := result["os"]
@@ -261,33 +280,42 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 	shasumURL := ""
 	shasumSigURL := ""
 
-	var repo *github.RepositoryRelease
-	for _, r := range repos {
-		for _, a := range r.Assets {
-			if v, err := detectSHASUM(*a.Name); err == nil && version == v.Version {
-				repo = r
-				break
+	if namespace == "hashicorp" {
+		d, _ := http.Get("https://registry.terraform.io" + c.Request().URL.Path)
+		data := DownloadResponse{}
+		_ = json.NewDecoder(d.Body).Decode(&data)
+		downloadURL = data.DownloadURL
+		shasumURL = data.ShasumsURL
+		shasumSigURL = data.ShasumsSignatureURL
+	} else {
+		var repo *github.RepositoryRelease
+		for _, r := range repos {
+			for _, a := range r.Assets {
+				if v, err := detectSHASUM(*a.Name); err == nil && version == v.Version {
+					repo = r
+					break
+				}
 			}
 		}
-	}
-	if repo == nil {
-		return c.JSON(http.StatusBadRequest, &ErrorResponse{
-			Status:  http.StatusBadRequest,
-			Message: fmt.Sprintf("cannot find version: %s", version),
-		})
-	}
-	for _, a := range repo.Assets {
-		if *a.Name == filename {
-			downloadURL, _ = client.getURL(c, a)
-			continue
+		if repo == nil {
+			return c.JSON(http.StatusBadRequest, &ErrorResponse{
+				Status:  http.StatusBadRequest,
+				Message: fmt.Sprintf("cannot find version: %s", version),
+			})
 		}
-		if *a.Name == shasumFilename {
-			shasumURL, _ = client.getURL(c, a)
-			continue
-		}
-		if *a.Name == shasumSigFilename {
-			shasumSigURL, _ = client.getURL(c, a)
-			continue
+		for _, a := range repo.Assets {
+			if *a.Name == filename {
+				downloadURL, _ = client.getURL(c, a)
+				continue
+			}
+			if *a.Name == shasumFilename {
+				shasumURL, _ = client.getURL(c, a)
+				continue
+			}
+			if *a.Name == shasumSigFilename {
+				shasumSigURL, _ = client.getURL(c, a)
+				continue
+			}
 		}
 	}
 
@@ -422,8 +450,6 @@ func getPublicKey(namespace string, provider string, path string) (string, strin
 
 	return string(data), key.KeyIdString(), nil
 }
-
-
 
 func parseVersions(repos []*github.RepositoryRelease) ([]Version, error) {
 	details := make([]Version, 0)
