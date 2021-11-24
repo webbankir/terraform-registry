@@ -25,6 +25,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -63,6 +64,7 @@ func main() {
 	e.GET("/v1/providers/:namespace/:type/*", client.providerHandler())
 	e.GET("/storage/:file", fromStorage())
 	_ = e.Start(":8181")
+
 }
 
 func fromStorage() echo.HandlerFunc {
@@ -87,59 +89,6 @@ func serviceDiscoveryHandler() echo.HandlerFunc {
 		}
 		return c.JSON(http.StatusOK, response)
 	}
-}
-
-type Client struct {
-	github        *github.Client
-	authenticated bool
-	http          *http.Client
-}
-
-type Platform struct {
-	Os   string `json:"os"`
-	Arch string `json:"arch"`
-}
-
-type VersionResponse struct {
-	ID       string      `json:"id"`
-	Versions []Version   `json:"versions"`
-	Warnings interface{} `json:"warnings"`
-}
-
-type GPGPublicKey struct {
-	KeyID          string      `json:"key_id"`
-	ASCIIArmor     string      `json:"ascii_armor"`
-	TrustSignature string      `json:"trust_signature"`
-	Source         string      `json:"source"`
-	SourceURL      interface{} `json:"source_url"`
-}
-
-type SigningKeys struct {
-	GpgPublicKeys []GPGPublicKey `json:"gpg_public_keys,omitempty"`
-}
-
-type DownloadResponse struct {
-	Protocols           []string    `json:"protocols,omitempty"`
-	Os                  string      `json:"os"`
-	Arch                string      `json:"arch"`
-	Filename            string      `json:"filename"`
-	DownloadURL         string      `json:"download_url"`
-	ShasumsURL          string      `json:"shasums_url"`
-	ShasumsSignatureURL string      `json:"shasums_signature_url"`
-	Shasum              string      `json:"shasum"`
-	SigningKeys         SigningKeys `json:"signing_keys"`
-}
-
-type ErrorResponse struct {
-	Status  int    `json:"status"`
-	Message string `json:"message"`
-}
-
-type Version struct {
-	Version      string               `json:"version"`
-	Protocols    []string             `json:"protocols,omitempty"`
-	Platforms    []Platform           `json:"platforms"`
-	ReleaseAsset *github.ReleaseAsset `json:"-"`
 }
 
 func newClient() *Client {
@@ -278,12 +227,14 @@ func (client *Client) providerHandler() echo.HandlerFunc {
 		default:
 			c.Set("namespace", namespace)
 			c.Set("provider", provider)
+			c.Set("provider_name", typeParam)
 			return client.performAction(c, param, repos)
 		}
 	}
 }
 
 func (client *Client) performAction(c echo.Context, param string, repos []*github.RepositoryRelease) error {
+
 	match := actionRegexp.FindStringSubmatch(param)
 	if len(match) < 2 {
 		fmt.Printf("repos: %v\n", repos)
@@ -340,7 +291,16 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 		}
 	}
 
-	downloadURL, err := filesToStorage(downloadURL)
+	pgpPublicKey, pgpPublicKeyID, err := getPublicKey(c.Get("namespace").(string), c.Get("provider_name").(string), c.Request().URL.Path)
+
+	if err != nil {
+		return c.JSON(http.StatusBadRequest, &ErrorResponse{
+			Status:  http.StatusBadRequest,
+			Message: fmt.Sprintf("failed getting pgp keys %v", err),
+		})
+	}
+
+	downloadURL, err = filesToStorage(downloadURL)
 	if err != nil {
 		return c.JSON(http.StatusBadRequest, &ErrorResponse{
 			Status:  http.StatusBadRequest,
@@ -372,14 +332,6 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 		})
 	}
 
-	pgpPublicKey, pgpPublicKeyID, err := getPublicKey()
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, &ErrorResponse{
-			Status:  http.StatusBadRequest,
-			Message: fmt.Sprintf("failed getting pgp keys %v", err),
-		})
-	}
-
 	switch result["action"] {
 	case "download":
 		return c.JSON(http.StatusOK, &DownloadResponse{
@@ -407,8 +359,48 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 	}
 }
 
-func getPublicKey() (string, string, error) {
-	data, err := os.ReadFile("/root/signkey.asc")
+func getPublicKey(namespace string, provider string, path string) (string, string, error) {
+
+	dir := storageDir + "/gpg/" + namespace + "/" + provider
+	file := dir + "/ascii_armor"
+
+	if _, err := os.Stat(file); os.IsNotExist(err) {
+
+		response, err := http.Get("https://registry.terraform.io" + path)
+
+		if err != nil {
+			return "", "", err
+		}
+		defer response.Body.Close()
+
+		data := DownloadResponse{}
+		err = json.NewDecoder(response.Body).Decode(&data)
+
+		if err != nil {
+			return "", "", err
+		}
+
+		if response.StatusCode != 200 {
+			return "", "", fmt.Errorf("not found")
+		}
+
+		if len(data.SigningKeys.GpgPublicKeys) == 0 {
+			return "", "", fmt.Errorf("No GpgPublicKeys in response.")
+		}
+
+		err = os.MkdirAll(dir, 0777)
+
+		if err != nil {
+			return "", "", err
+		}
+
+		err = os.WriteFile(file, []byte(fmt.Sprintf("%v", data.SigningKeys.GpgPublicKeys[0].ASCIIArmor)), 0666)
+		if err != nil {
+			return "", "", err
+		}
+	}
+
+	data, err := os.ReadFile(file)
 	if err != nil {
 		return "", "", err
 	}
@@ -430,6 +422,8 @@ func getPublicKey() (string, string, error) {
 
 	return string(data), key.KeyIdString(), nil
 }
+
+
 
 func parseVersions(repos []*github.RepositoryRelease) ([]Version, error) {
 	details := make([]Version, 0)
