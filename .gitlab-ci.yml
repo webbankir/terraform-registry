@@ -1,0 +1,14 @@
+image: golang
+
+stage:
+  - main
+
+
+main:
+  stage: main
+  script:
+    - GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o terraform-registry -ldflags "-X main.GitCommit=${CI_COMMIT_TAG}"
+    - 'curl --header "JOB-TOKEN: $CI_JOB_TOKEN" --upload-file terraform-registry "${CI_API_V4_URL}/projects/24/packages/generic/terraform-registry/${CI_COMMIT_TAG}/terraform-registry"'
+  only:
+   - tags
+  tags: docker-fast

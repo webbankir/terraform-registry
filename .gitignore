@@ -6,5 +6,6 @@
 
 /*.env
 /*.yml
+!.gitlab-ci.yml
 dist/
 app
