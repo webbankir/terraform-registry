@@ -27,14 +27,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
+	"github.com/miguelmota/go-filecache"
+	"golang.org/x/crypto/openpgp/packet"
 	"net/http"
-	"net/url"
 	"os"
 	"regexp"
 	"strings"
-
-	"golang.org/x/crypto/openpgp/packet"
+	"time"
 
 	"golang.org/x/crypto/openpgp/armor"
 
@@ -61,7 +60,7 @@ func main() {
 	client := newClient()
 
 	e.GET("/.well-known/terraform.json", serviceDiscoveryHandler())
-	e.GET("/v1/providers/hashicorp/:type/versions", client.providerHandlerHashicorp())
+	//e.GET("/v1/providers/hashicorp/:type/versions", client.providerHandlerHashicorp())
 	e.GET("/v1/providers/:namespace/:type/*", client.providerHandler())
 	e.GET("/storage/:file", fromStorage())
 	_ = e.Start(":8181")
@@ -130,48 +129,6 @@ func (client *Client) getURL(c echo.Context, asset *github.ReleaseAsset) (string
 	return *asset.BrowserDownloadURL, nil
 }
 
-func filesToStorage(assetURL string) (string, error) {
-	u, err := url.Parse(assetURL)
-
-	if err != nil {
-		return "", err
-	}
-
-	if _, err := os.Stat(storageDir + u.Path); os.IsNotExist(err) {
-		items := strings.Split(u.Path, "/")
-		items = items[:len(items)-1]
-		newDir := fmt.Sprintf("%v%v", storageDir, strings.Join(items, "/"))
-		err = os.MkdirAll(newDir, 0777)
-
-		if err != nil {
-			return "", err
-		}
-
-		resp, err := http.Get(assetURL)
-
-		if err != nil {
-			return "", err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != 200 {
-			return "", fmt.Errorf("not found")
-		}
-		b, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", err
-		}
-
-		//_, err = ff.Write(b)
-		err = os.WriteFile(storageDir+u.Path, b, 0644)
-		if err != nil {
-			return "", err
-		}
-
-	}
-	return "https://tf-providers.infra.tec1group.com/storage" + u.Path, nil
-}
-
 func getShasum(asset string, shasumURL string) (string, error) {
 	resp, err := http.Get(shasumURL)
 	if err != nil {
@@ -203,21 +160,15 @@ func (client *Client) providerHandler() echo.HandlerFunc {
 		param := c.Param("*")
 		provider := "terraform-provider-" + typeParam
 
-		repos, _, err := client.github.Repositories.ListReleases(context.Background(),
-			namespace, provider, nil)
+		versions, repos, err := client.getVersions(namespace, provider, typeParam, c.Request().URL.Path)
+
 		if err != nil {
 			return c.JSON(http.StatusBadRequest, &ErrorResponse{
 				Status:  http.StatusBadRequest,
 				Message: err.Error(),
 			})
 		}
-		versions, err := parseVersions(repos)
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, &ErrorResponse{
-				Status:  http.StatusBadRequest,
-				Message: err.Error(),
-			})
-		}
+
 		switch param {
 		case "versions":
 			response := &VersionResponse{
@@ -234,25 +185,7 @@ func (client *Client) providerHandler() echo.HandlerFunc {
 	}
 }
 
-func (client *Client) providerHandlerHashicorp() echo.HandlerFunc {
-	return func(c echo.Context) error {
-		d, err := http.Get("https://registry.terraform.io" + c.Request().URL.Path)
-
-		if err != nil {
-			return c.JSON(http.StatusBadRequest, &ErrorResponse{
-				Status:  http.StatusBadRequest,
-				Message: err.Error(),
-			})
-		}
-
-		data := VersionResponse{}
-		err = json.NewDecoder(d.Body).Decode(&data)
-		return c.JSON(http.StatusOK, data)
-	}
-}
-
 func (client *Client) performAction(c echo.Context, param string, repos []*github.RepositoryRelease) error {
-
 	match := actionRegexp.FindStringSubmatch(param)
 	if len(match) < 2 {
 		fmt.Printf("repos: %v\n", repos)
@@ -280,89 +213,95 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 	shasumURL := ""
 	shasumSigURL := ""
 
-	if namespace == "hashicorp" {
-		d, _ := http.Get("https://registry.terraform.io" + c.Request().URL.Path)
-		data := DownloadResponse{}
-		_ = json.NewDecoder(d.Body).Decode(&data)
-		downloadURL = data.DownloadURL
-		shasumURL = data.ShasumsURL
-		shasumSigURL = data.ShasumsSignatureURL
-	} else {
-		var repo *github.RepositoryRelease
-		for _, r := range repos {
-			for _, a := range r.Assets {
-				if v, err := detectSHASUM(*a.Name); err == nil && version == v.Version {
-					repo = r
-					break
+	cacheKey := namespace + "-" + provider + "-" + version + "-" + arch
+
+	downloadResponse := DownloadResponse{}
+
+	founded, _ := filecache.Get(cacheKey, &downloadResponse)
+
+	if !founded {
+		if namespace == "hashicorp" {
+			data := DownloadResponse{}
+			d, _ := http.Get("https://registry.terraform.io" + c.Request().URL.Path)
+			_ = json.NewDecoder(d.Body).Decode(&data)
+
+			downloadURL = data.DownloadURL
+			shasumURL = data.ShasumsURL
+			shasumSigURL = data.ShasumsSignatureURL
+		} else {
+			var repo *github.RepositoryRelease
+			for _, r := range repos {
+				for _, a := range r.Assets {
+					if v, err := detectSHASUM(*a.Name); err == nil && version == v.Version {
+						repo = r
+						break
+					}
+				}
+			}
+			if repo == nil {
+				return c.JSON(http.StatusBadRequest, &ErrorResponse{
+					Status:  http.StatusBadRequest,
+					Message: fmt.Sprintf("cannot find version: %s", version),
+				})
+			}
+			for _, a := range repo.Assets {
+				if *a.Name == filename {
+					downloadURL, _ = client.getURL(c, a)
+					continue
+				}
+				if *a.Name == shasumFilename {
+					shasumURL, _ = client.getURL(c, a)
+					continue
+				}
+				if *a.Name == shasumSigFilename {
+					shasumSigURL, _ = client.getURL(c, a)
+					continue
 				}
 			}
 		}
-		if repo == nil {
+
+		pgpPublicKey, pgpPublicKeyID, err := getPublicKey(c.Get("namespace").(string), c.Get("provider_name").(string), c.Request().URL.Path)
+
+		if err != nil {
 			return c.JSON(http.StatusBadRequest, &ErrorResponse{
 				Status:  http.StatusBadRequest,
-				Message: fmt.Sprintf("cannot find version: %s", version),
+				Message: fmt.Sprintf("failed getting pgp keys %v", err),
 			})
 		}
-		for _, a := range repo.Assets {
-			if *a.Name == filename {
-				downloadURL, _ = client.getURL(c, a)
-				continue
-			}
-			if *a.Name == shasumFilename {
-				shasumURL, _ = client.getURL(c, a)
-				continue
-			}
-			if *a.Name == shasumSigFilename {
-				shasumSigURL, _ = client.getURL(c, a)
-				continue
-			}
+
+		downloadURL, err = filesToStorage(downloadURL)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, &ErrorResponse{
+				Status:  http.StatusBadRequest,
+				Message: fmt.Sprintf("[WB] Error: %v", err),
+			})
 		}
-	}
 
-	pgpPublicKey, pgpPublicKeyID, err := getPublicKey(c.Get("namespace").(string), c.Get("provider_name").(string), c.Request().URL.Path)
+		shasumSigURL, err = filesToStorage(shasumSigURL)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, &ErrorResponse{
+				Status:  http.StatusBadRequest,
+				Message: fmt.Sprintf("[WB] Error: %v", err),
+			})
+		}
 
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, &ErrorResponse{
-			Status:  http.StatusBadRequest,
-			Message: fmt.Sprintf("failed getting pgp keys %v", err),
-		})
-	}
+		shasum, err := getShasum(filename, shasumURL)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, &ErrorResponse{
+				Status:  http.StatusBadRequest,
+				Message: fmt.Sprintf("failed getting shasum %v", err),
+			})
+		}
 
-	downloadURL, err = filesToStorage(downloadURL)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, &ErrorResponse{
-			Status:  http.StatusBadRequest,
-			Message: fmt.Sprintf("[WB] Error: %v", err),
-		})
-	}
+		shasumURL, err = filesToStorage(shasumURL)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, &ErrorResponse{
+				Status:  http.StatusBadRequest,
+				Message: fmt.Sprintf("[WB] Error: %v", err),
+			})
+		}
 
-	shasumSigURL, err = filesToStorage(shasumSigURL)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, &ErrorResponse{
-			Status:  http.StatusBadRequest,
-			Message: fmt.Sprintf("[WB] Error: %v", err),
-		})
-	}
-
-	shasum, err := getShasum(filename, shasumURL)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, &ErrorResponse{
-			Status:  http.StatusBadRequest,
-			Message: fmt.Sprintf("failed getting shasum %v", err),
-		})
-	}
-
-	shasumURL, err = filesToStorage(shasumURL)
-	if err != nil {
-		return c.JSON(http.StatusBadRequest, &ErrorResponse{
-			Status:  http.StatusBadRequest,
-			Message: fmt.Sprintf("[WB] Error: %v", err),
-		})
-	}
-
-	switch result["action"] {
-	case "download":
-		return c.JSON(http.StatusOK, &DownloadResponse{
+		downloadResponse = DownloadResponse{
 			Os:                  result["os"],
 			Arch:                result["arch"],
 			Filename:            filename,
@@ -378,10 +317,20 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 					},
 				},
 			},
-		})
+		}
+
+		filecache.Set(cacheKey, downloadResponse, 24*30*time.Hour)
+
+	} else {
+		fmt.Printf("\n[2]Found key %v in cache\n", cacheKey)
+	}
+
+	switch result["action"] {
+	case "download":
+		return c.JSON(http.StatusOK, &downloadResponse)
 	default:
-		return c.JSON(http.StatusBadRequest, &ErrorResponse{
-			Status:  http.StatusBadRequest,
+		return c.JSON(http.StatusNotFound, &ErrorResponse{
+			Status:  http.StatusNotFound,
 			Message: fmt.Sprintf("unsupported action %s", result["action"]),
 		})
 	}
@@ -449,56 +398,4 @@ func getPublicKey(namespace string, provider string, path string) (string, strin
 	key, _ := pkt.(*packet.PublicKey)
 
 	return string(data), key.KeyIdString(), nil
-}
-
-func parseVersions(repos []*github.RepositoryRelease) ([]Version, error) {
-	details := make([]Version, 0)
-	for _, r := range repos {
-		for _, a := range r.Assets {
-			assetDetails, err := detectSHASUM(*a.Name)
-			if err == nil {
-				assetDetails.Platforms = collectPlatforms(r.Assets)
-				details = append(details, *assetDetails)
-				break
-			}
-		}
-	}
-	return details, nil
-}
-
-func detectSHASUM(name string) (*Version, error) {
-	match := shasumRegexp.FindStringSubmatch(name)
-	if len(match) < 2 {
-		return nil, fmt.Errorf("nomatch %d", len(match))
-	}
-	result := make(map[string]string)
-	for i, name := range shasumRegexp.SubexpNames() {
-		if i != 0 && name != "" {
-			result[name] = match[i]
-		}
-	}
-	return &Version{
-		Version: result["version"],
-	}, nil
-}
-
-func collectPlatforms(assets []*github.ReleaseAsset) []Platform {
-	platforms := make([]Platform, 0)
-	for _, a := range assets {
-		match := binaryRegexp.FindStringSubmatch(*a.Name)
-		if len(match) < 2 {
-			continue
-		}
-		result := make(map[string]string)
-		for i, name := range binaryRegexp.SubexpNames() {
-			if i != 0 && name != "" {
-				result[name] = match[i]
-			}
-		}
-		platforms = append(platforms, Platform{
-			Os:   result["os"],
-			Arch: result["arch"],
-		})
-	}
-	return platforms
 }
