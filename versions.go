@@ -11,6 +11,7 @@ import (
 )
 
 func (client *Client) getVersions(namespace string, provider string, typeParam string, urlPath string) ([]Version, []*github.RepositoryRelease, error) {
+	var err error
 	versions := make([]Version, 0)
 	repos := make([]*github.RepositoryRelease, 0)
 	cacheKeyVersions := namespace + "-" + typeParam + "-versions"
@@ -18,8 +19,7 @@ func (client *Client) getVersions(namespace string, provider string, typeParam s
 
 	foundedRepos, _ := filecache.Get(cacheKeyRepos, &repos)
 	if !foundedRepos && namespace != "hashicorp" {
-		repos, _, err := client.github.Repositories.ListReleases(context.Background(), namespace, provider, nil)
-
+		repos, _, err = client.github.Repositories.ListReleases(context.Background(), namespace, provider, nil)
 		if err != nil {
 			return versions, repos, err
 		}
@@ -29,7 +29,7 @@ func (client *Client) getVersions(namespace string, provider string, typeParam s
 
 	founded, _ := filecache.Get(cacheKeyVersions, &versions)
 
-	if !founded {
+	if !founded || len(versions) == 0 {
 
 		if namespace == "hashicorp" {
 			d, err := http.Get("https://registry.terraform.io" + urlPath)
@@ -44,7 +44,7 @@ func (client *Client) getVersions(namespace string, provider string, typeParam s
 			return data.Versions, repos, err
 		} else {
 
-			versions, err := parseVersions(repos)
+			versions, err = parseVersions(repos)
 			if err != nil {
 				return versions, repos, err
 			}
