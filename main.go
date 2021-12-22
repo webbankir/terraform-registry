@@ -213,7 +213,7 @@ func (client *Client) performAction(c echo.Context, param string, repos []*githu
 	shasumURL := ""
 	shasumSigURL := ""
 
-	cacheKey := namespace + "-" + provider + "-" + version + "-" + arch
+	cacheKey := namespace + "-" + provider + "-" + version + "-" + os + "-" + arch
 
 	downloadResponse := DownloadResponse{}
 
